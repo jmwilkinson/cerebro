@@ -9,6 +9,8 @@ angular.module('cerebro').factory('DataService', ['$rootScope', '$timeout',
 
     var password;
 
+    var onGoingRequests = {};
+
     this.getHost = function() {
       return host;
     };
@@ -19,6 +21,14 @@ angular.module('cerebro').factory('DataService', ['$rootScope', '$timeout',
       password = newPassword;
       $location.search('host', newHost);
       RefreshService.refresh();
+    };
+
+    this.disconnect = function() {
+      host = undefined;
+      username = undefined;
+      password = undefined;
+      onGoingRequests = {};
+      $location.path('/connect');
     };
 
     if ($location.search().host) {
@@ -65,15 +75,6 @@ angular.module('cerebro').factory('DataService', ['$rootScope', '$timeout',
       clusterRequest('cluster_changes', {}, success, error);
     };
 
-    // ---------- Connect ----------
-    this.getHosts = function(success, error) {
-      var config = {
-        method: 'GET',
-        url: 'connect/hosts'
-      };
-      request(config, success, error);
-    };
-
     // ---------- External API ----------
 
     this.send = function(path, data, success, error) {
@@ -100,20 +101,33 @@ angular.module('cerebro').factory('DataService', ['$rootScope', '$timeout',
 
     var request = function(config, success, error) {
       var handleSuccess = function(data) {
-        if (data.status === 303) {
-          $window.location.href = 'login';
-        } else {
-          if (data.status >= 200 && data.status < 300) {
-            success(data.body);
-          } else {
-            error(data.body);
-          }
+        onGoingRequests[config.url] = undefined;
+        switch (data.status) {
+          case 303: // unauthorized in cerebro
+            $window.location.href = './login';
+            break;
+          case 401: // unauthorized in ES instance
+            $location.path('/connect').search({host: host, unauthorized: true});
+            break;
+          default:
+            if (data.status >= 200 && data.status < 300) {
+              success(data.body);
+            } else {
+              error(data.body);
+            }
         }
       };
       var handleError = function(data) {
+        onGoingRequests[config.url] = undefined;
         AlertService.error('Error connecting to the server', data.error);
       };
-      $http(config).success(handleSuccess).error(handleError);
+      var activeRequest = onGoingRequests[config.url] !== undefined;
+      var now = new Date().getTime();
+      var interval = RefreshService.getInterval();
+      if (!activeRequest || now - onGoingRequests[config.url] < interval) {
+        $http(config).success(handleSuccess).error(handleError);
+        onGoingRequests[config.url] = new Date().getTime();
+      }
     };
 
     return this;

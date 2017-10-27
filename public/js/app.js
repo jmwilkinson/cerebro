@@ -486,15 +486,19 @@ angular.module('cerebro').factory('ClusterSettingsDataService', ['DataService',
 ]);
 
 angular.module('cerebro').controller('ConnectController', [
-  '$scope', '$location', 'DataService', 'AlertService',
-  function($scope, $location, DataService, AlertService) {
+  '$scope', '$location', 'ConnectDataService', 'AlertService',
+  function($scope, $location, ConnectDataService, AlertService) {
 
     $scope.hosts = undefined;
 
     $scope.connecting = false;
 
+    $scope.unauthorized = false;
+
+    $scope.feedback = undefined;
+
     $scope.setup = function() {
-      DataService.getHosts(
+      ConnectDataService.getHosts(
         function(hosts) {
           $scope.hosts = hosts;
         },
@@ -502,17 +506,103 @@ angular.module('cerebro').controller('ConnectController', [
           AlertService.error('Error while fetching list of known hosts', error);
         }
       );
+      $scope.host = $location.search().host;
+      $scope.unauthorized = $location.search().unauthorized;
     };
 
-    $scope.connect = function(host, username, password) {
-      if (host) {
-        $scope.connecting = true;
-        DataService.setHost(host, username, password);
-        $location.path('/overview');
-      }
+    $scope.connect = function(host) {
+      $scope.feedback = undefined;
+      $scope.host = host;
+      $scope.connecting = true;
+      var success = function(data) {
+        $scope.connecting = false;
+        switch (data.status) {
+          case 200:
+            ConnectDataService.connect(host);
+            $location.path('/overview');
+            break;
+          case 401:
+            $scope.unauthorized = true;
+            break;
+          default:
+            feedback('Unexpected response status: [' + data.status + ']');
+        }
+      };
+      var error = function(data) {
+        $scope.connecting = false;
+        AlertService.error('Error connecting to [' + host + ']', data);
+      };
+      ConnectDataService.testConnection(host, success, error);
+    };
+
+    $scope.authorize = function(host, username, pwd) {
+      $scope.feedback = undefined;
+      $scope.connecting = true;
+      var success = function(data) {
+        $scope.connecting = false;
+        switch (data.status) {
+          case 401:
+            feedback('Invalid username or password');
+            break;
+          case 200:
+            ConnectDataService.connectWithCredentials(host, username, pwd);
+            $location.path('/overview');
+            break;
+          default:
+            feedback('Unexpected response status: [' + data.status + ']');
+        }
+      };
+      var error = function(data) {
+        $scope.connecting = false;
+        AlertService.error('Error connecting to [' + host + ']', data);
+      };
+      ConnectDataService.testCredentials(host, username, pwd, success, error);
+    };
+
+    var feedback = function(message) {
+      $scope.feedback = message;
     };
 
   }]);
+
+angular.module('cerebro').factory('ConnectDataService', ['$http', 'DataService',
+  function($http, DataService) {
+
+    this.getHosts = function(success, error) {
+      var config = {method: 'GET', url: 'connect/hosts'};
+      var handleSuccess = function(data) {
+        if (data.status >= 200 && data.status < 300) {
+          success(data.body);
+        } else {
+          error(data.body);
+        }
+      };
+      $http(config).success(handleSuccess).error(error);
+    };
+
+    this.testConnection = function(host, success, error) {
+      var config = {method: 'POST', url: 'connect', data: {host: host}};
+      $http(config).success(success).error(error);
+    };
+
+    this.testCredentials = function(host, username, password, success, error) {
+      var data = {host: host, username: username, password: password};
+      var config = {method: 'POST', url: 'connect', data: data};
+      $http(config).success(success).error(error);
+    };
+
+    this.connect = function(host) {
+      DataService.setHost(host);
+    };
+
+    this.connectWithCredentials = function(host, username, password) {
+      DataService.setHost(host, username, password);
+    };
+
+    return this;
+
+  }
+]);
 
 angular.module('cerebro').controller('CreateIndexController', ['$scope',
   'AlertService', 'DataService', 'AceEditorService', 'RefreshService',
@@ -703,6 +793,14 @@ angular.module('cerebro').controller('NavbarController', ['$scope', '$http',
       $scope.refreshInterval = interval;
     };
 
+    $scope.disconnect = function() {
+      $scope.status = undefined;
+      $scope.cluster_name = undefined;
+      $scope.host = undefined;
+      $scope.username = undefined;
+      DataService.disconnect();
+    };
+
     $scope.$watch(
       function() {
         return RefreshService.lastUpdate();
@@ -822,7 +920,7 @@ angular.module('cerebro').controller('OverviewController', ['$scope', '$http',
     $scope.special_indices = 0;
     $scope.shardAllocation = true;
 
-    $scope.indices_filter = new IndexFilter('', true, false, true, true, 0);
+    $scope.indices_filter = new IndexFilter('', false, false, true, true, 0);
     $scope.nodes_filter = new NodeFilter('', true, false, false, false, 0);
 
     $scope.getPageSize = function() {
@@ -866,6 +964,11 @@ angular.module('cerebro').controller('OverviewController', ['$scope', '$http',
           $scope.closed_indices = data.closed_indices;
           $scope.special_indices = data.special_indices;
           $scope.shardAllocation = data.shard_allocation;
+          if (!$scope.unassigned_shards &&
+            !$scope.relocating_shards &&
+            !$scope.initializing_shards) {
+            $scope.indices_filter.healthy = true;
+          }
         },
         function(error) {
           AlertService.error('Error while loading data', error);
@@ -964,6 +1067,15 @@ angular.module('cerebro').controller('OverviewController', ['$scope', '$http',
       );
     };
 
+    $scope.flushIndex = function(index) {
+      ModalService.promptConfirmation(
+        'Flush index ' + index + '?',
+        function() {
+          OverviewDataService.flushIndex(index, success, error);
+        }
+      );
+    };
+
     $scope.forceMerge = function(index) {
       ModalService.promptConfirmation(
         'Optimize index ' + index + '?',
@@ -1019,6 +1131,18 @@ angular.module('cerebro').controller('OverviewController', ['$scope', '$http',
         'Refresh all ' + indices.length + ' selected indices?',
         function() {
           OverviewDataService.refreshIndex(indices.join(','), success, error);
+        }
+      );
+    };
+
+    $scope.flushIndices = function() {
+      var indices = $scope.paginator.getResults().map(function(index) {
+        return index.name;
+      });
+      ModalService.promptConfirmation(
+        'Flush all ' + indices.length + ' selected indices?',
+        function() {
+          OverviewDataService.flushIndex(indices.join(','), success, error);
         }
       );
     };
@@ -1152,6 +1276,11 @@ angular.module('cerebro').factory('OverviewDataService', ['DataService',
     this.refreshIndex = function(index, success, error) {
       var data = {indices: index};
       DataService.send('overview/refresh_indices', data, success, error);
+    };
+
+    this.flushIndex = function(index, success, error) {
+      var data = {indices: index};
+      DataService.send('overview/flush_indices', data, success, error);
     };
 
     this.clearIndexCache = function(index, success, error) {
@@ -1328,6 +1457,7 @@ angular.module('cerebro').controller('RestController', ['$scope', '$http',
     $scope.response = undefined;
 
     $scope.mappings = undefined;
+    $scope.host = undefined;
 
     $scope.method = 'POST';
     $scope.path = '';
@@ -1343,9 +1473,13 @@ angular.module('cerebro').controller('RestController', ['$scope', '$http',
     };
 
     $scope.execute = function() {
-      var data = $scope.editor.getValue();
+      var data = $scope.editor.getStringValue();
       var method = $scope.method;
       $scope.response = undefined;
+      try {
+        data = $scope.editor.getValue();
+      } catch (error) {
+      }
       RestDataService.execute(method, $scope.path, data, success, failure);
     };
 
@@ -1354,7 +1488,8 @@ angular.module('cerebro').controller('RestController', ['$scope', '$http',
       $scope.editor.setValue('{}');
       RestDataService.load(
         function(response) {
-          $scope.mappings = response;
+          $scope.host = response.host;
+          $scope.mappings = response.mappings;
           $scope.updateOptions($scope.path);
         },
         function(error) {
@@ -1391,13 +1526,12 @@ angular.module('cerebro').controller('RestController', ['$scope', '$http',
 
     $scope.copyAsCURLCommand = function() {
       var method = $scope.method;
-      var host = RestDataService.getHost();
       var path = encodeURI($scope.path);
       if (path.substring(0, 1) !== '/') {
         path = '/' + path;
       }
       var body = JSON.stringify($scope.editor.getValue(), undefined, 1);
-      var curl = 'curl -X' + method + ' \'' + host + path + '\'';
+      var curl = 'curl -X' + method + ' \'' + $scope.host + path + '\'';
       if (['POST', 'PUT'].indexOf(method) >= 0) {
         curl += ' -d \'' + body + '\'';
       }
@@ -1608,7 +1742,6 @@ angular.module('cerebro').factory('SnapshotsDataService', ['DataService',
         includeGlobalState: includeGlobalState,
         indices: indices
       };
-      console.log(data);
       DataService.send('snapshots/restore', data, success, error);
     };
 
@@ -1811,6 +1944,10 @@ function AceEditor(target) {
     }
   };
 
+  this.getStringValue = function() {
+    return this.editor.getValue();
+  };
+
   // formats the json content
   this.format = function() {
     try {
@@ -2005,8 +2142,8 @@ function IndexFilter(name, closed, special, healthy, asc, timestamp) {
       catch (err) { // if not valid regexp, still try normal matching
         matches = index.name.indexOf(this.name.toLowerCase()) != -1;
         if (!matches) {
-          for (var idx = 0; idx < index.aliases.length; idx++) {
-            var alias = index.aliases[idx].toLowerCase();
+          for (var _idx = 0; _idx < index.aliases.length; _idx++) {
+            var alias = index.aliases[_idx].toLowerCase();
             matches = true;
             if ((matches = (alias.indexOf(this.name.toLowerCase()) != -1))) {
               break;
@@ -2334,6 +2471,7 @@ function URLAutocomplete(mappings) {
     /**
      * Replaces the variables on suggestedPathTokens({index}, {type}...) for
      * actual values extracted from pathTokens
+     *
      * @param {Array} pathTokens tokens for the path to be suggested
      * @param {Array} suggestedPathTokens tokens for the suggested path
      * @returns {Array} a new array with the variables from suggestedPathTokens
@@ -2683,6 +2821,8 @@ angular.module('cerebro').factory('DataService', ['$rootScope', '$timeout',
 
     var password;
 
+    var onGoingRequests = {};
+
     this.getHost = function() {
       return host;
     };
@@ -2693,6 +2833,14 @@ angular.module('cerebro').factory('DataService', ['$rootScope', '$timeout',
       password = newPassword;
       $location.search('host', newHost);
       RefreshService.refresh();
+    };
+
+    this.disconnect = function() {
+      host = undefined;
+      username = undefined;
+      password = undefined;
+      onGoingRequests = {};
+      $location.path('/connect');
     };
 
     if ($location.search().host) {
@@ -2739,15 +2887,6 @@ angular.module('cerebro').factory('DataService', ['$rootScope', '$timeout',
       clusterRequest('cluster_changes', {}, success, error);
     };
 
-    // ---------- Connect ----------
-    this.getHosts = function(success, error) {
-      var config = {
-        method: 'GET',
-        url: 'connect/hosts'
-      };
-      request(config, success, error);
-    };
-
     // ---------- External API ----------
 
     this.send = function(path, data, success, error) {
@@ -2774,20 +2913,33 @@ angular.module('cerebro').factory('DataService', ['$rootScope', '$timeout',
 
     var request = function(config, success, error) {
       var handleSuccess = function(data) {
-        if (data.status === 303) {
-          $window.location.href = 'login';
-        } else {
-          if (data.status >= 200 && data.status < 300) {
-            success(data.body);
-          } else {
-            error(data.body);
-          }
+        onGoingRequests[config.url] = undefined;
+        switch (data.status) {
+          case 303: // unauthorized in cerebro
+            $window.location.href = './login';
+            break;
+          case 401: // unauthorized in ES instance
+            $location.path('/connect').search({host: host, unauthorized: true});
+            break;
+          default:
+            if (data.status >= 200 && data.status < 300) {
+              success(data.body);
+            } else {
+              error(data.body);
+            }
         }
       };
       var handleError = function(data) {
+        onGoingRequests[config.url] = undefined;
         AlertService.error('Error connecting to the server', data.error);
       };
-      $http(config).success(handleSuccess).error(handleError);
+      var activeRequest = onGoingRequests[config.url] !== undefined;
+      var now = new Date().getTime();
+      var interval = RefreshService.getInterval();
+      if (!activeRequest || now - onGoingRequests[config.url] < interval) {
+        $http(config).success(handleSuccess).error(handleError);
+        onGoingRequests[config.url] = new Date().getTime();
+      }
     };
 
     return this;
@@ -2884,7 +3036,7 @@ angular.module('cerebro').factory('RefreshService',
 
     var timestamp = new Date().getTime();
 
-    var interval = 5000;
+    var interval = 15000;
 
     this.getInterval = function() {
       return interval;
